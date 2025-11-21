@@ -119,7 +119,7 @@ struct MotorTune {
 // - pid.kp / pid.ki / pid.kd untuk masing-masing motor
 MotorTune motors[MOTOR_COUNT] = {
   //  minFwd, minRev, compFwd, compRev,     {kp,   ki,   kd,   integral, prevErr}
-  {70,  80,   1.00f,  1.00f,  {2.9f, 0.03f, 0.25f, 0.0f, 0.0f}},  // M1 - kiri depan
+  {70,  80,   1.00f,  1.00f,  {2.6f, 0.03f, 0.25f, 0.0f, 0.0f}},  // M1 - kiri depan
   {70,  80,   1.00f,  1.00f,  {2.6f, 0.03f, 0.25f, 0.0f, 0.0f}},  // M2 - kanan depan
   {70,  80,   1.00f,  1.00f,  {2.6f, 0.03f, 0.25f, 0.0f, 0.0f}},  // M3 - kiri belakang
   {70,  80,   1.00f,  1.00f,  {2.6f, 0.03f, 0.25f, 0.0f, 0.0f}}   // M4 - kanan belakang
