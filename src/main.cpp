@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <ArduinoJson.h>
 
 /* ===========================================================
    PPM INPUT (SINYAL REMOTE)
@@ -114,6 +113,10 @@ struct MotorTune {
 };
 
 // TUNING PER MOTOR
+// Kalau nanti ada yang kepanjangan serong, mainkan:
+// - compFwd / compRev (scale RPM)
+// - minFwd / minRev   (batas start PWM)
+// - pid.kp / pid.ki / pid.kd untuk masing-masing motor
 MotorTune motors[MOTOR_COUNT] = {
   //  minFwd, minRev, compFwd, compRev,     {kp,   ki,   kd,   integral, prevErr}
   {70,  80,   1.00f,  1.00f,  {2.6f, 0.03f, 0.25f, 0.0f, 0.0f}},  // M1 - kiri depan
@@ -155,9 +158,11 @@ int applyMinPwm(float cmd, const MotorTune &m, float targetTick) {
   bool fwd = (cmd > 0.0f);
   int base = fwd ? m.minFwd : m.minRev;
 
+  // Dinamis sedikit tergantung target (semakin kencang, minPWM boleh naik dikit)
   float dyn = base + 0.25f * fabs(targetTick);
   dyn = constrain(dyn, base, 160.0f);
 
+  // Map |cmd| (0..255) → [dyn .. 255]
   float out = dyn + (255.0f - dyn) * (fabs(cmd) / 255.0f);
 
   return (cmd > 0.0f) ? (int)out : -(int)out;
@@ -167,125 +172,29 @@ int applyMinPwm(float cmd, const MotorTune &m, float targetTick) {
    GLOBAL & PARAMETER TUNING
    =========================================================== */
 
+// perintah PWM "mentah" (sebelum minPWM & kompensasi)
 float motorCmd[MOTOR_COUNT] = {0};
+
+// target tick/loop maksimum
 const float MAX_TICK   = 50.0f;
+
+// batas akselerasi PWM per loop
 const float ACCEL_STEP = 8.0f;
+
+// smoothing input joystick
 float Xs = 0.0f, Ys = 0.0f, Rs = 0.0f;
 
+// TRIM input X beda maju & mundur (supaya maju dan mundur sama2 lurus)
 float TRIM_X_FWD =  0.005f;   // saat joystick Y ≥ 0 (maju)
 float TRIM_X_REV = -0.005f;   // saat joystick Y <  0 (mundur)
 float TRIM_R     =  0.0f;     // kalau robot suka muter saat maju mundur
 
+// loop timing
 unsigned long lastLoopMs = 0;
 
-#define DEBUG_PRINT 0
+// Debug print
+#define DEBUG_PRINT 1
 uint16_t debugCounter = 0;
-
-/* ===========================================================
-   SERIAL BRIDGE STATE
-   =========================================================== */
-const unsigned long SERIAL_CMD_TIMEOUT_MS = 300;
-const unsigned long TELEMETRY_PERIOD_MS   = 20;
-const float AUTO_CMD_THRESHOLD = 0.05f;
-const float MANUAL_GAS_THRESHOLD = 0.05f;
-
-char serialLine[160];
-size_t serialPos = 0;
-StaticJsonDocument<200> rxJson;
-
-float autoX = 0.0f, autoY = 0.0f, autoR = 0.0f;
-unsigned long lastSerialCmdMs = 0;
-unsigned long lastTelemetryMs = 0;
-bool autonomousMode = false;
-
-void applySerialCommand(float x, float y, float r) {
-  autoX = constrain(x, -1.0f, 1.0f);
-  autoY = constrain(y, -1.0f, 1.0f);
-  autoR = constrain(r, -1.0f, 1.0f);
-  lastSerialCmdMs = millis();
-}
-
-void processJsonCommand() {
-  float cmdX = 0.0f;
-  float cmdY = 0.0f;
-  float cmdR = 0.0f;
-
-  if (rxJson.containsKey("cmd_x")) cmdX = rxJson["cmd_x"];
-  else if (rxJson.containsKey("cmd_lat")) cmdX = rxJson["cmd_lat"];
-  else if (rxJson.containsKey("cmd_y")) cmdX = rxJson["cmd_y"];
-
-  if (rxJson.containsKey("cmd_y")) cmdY = rxJson["cmd_y"];
-  else if (rxJson.containsKey("cmd_lin")) cmdY = rxJson["cmd_lin"];
-
-  if (rxJson.containsKey("cmd_r")) cmdR = rxJson["cmd_r"];
-  else if (rxJson.containsKey("cmd_ang")) cmdR = rxJson["cmd_ang"];
-  else if (rxJson.containsKey("cmd_w")) cmdR = rxJson["cmd_w"];
-
-  applySerialCommand(cmdX, cmdY, cmdR);
-}
-
-void handleSerialInput() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\r') continue;
-
-    if (c == '\n') {
-      if (serialPos > 0) {
-        serialLine[serialPos] = '\0';
-        DeserializationError err = deserializeJson(rxJson, serialLine);
-        if (!err) {
-          processJsonCommand();
-        }
-      }
-      serialPos = 0;
-    } else {
-      if (serialPos < sizeof(serialLine) - 1) {
-        serialLine[serialPos++] = c;
-      } else {
-        serialPos = 0; // overflow, drop line
-      }
-    }
-  }
-}
-
-void sendTelemetry(unsigned long nowMs, float gas, bool ppmOk) {
-  if (nowMs - lastTelemetryMs < TELEMETRY_PERIOD_MS) return;
-  lastTelemetryMs = nowMs;
-
-  long encSnap[MOTOR_COUNT];
-  noInterrupts();
-  for (size_t i = 0; i < MOTOR_COUNT; i++) {
-    encSnap[i] = encCount[i];
-  }
-  interrupts();
-
-  StaticJsonDocument<320> tx;
-  tx["mode"] = autonomousMode ? "auto" : "manual";
-  tx["gas"] = gas;
-  tx["ppm"] = ppmOk ? 1 : 0;
-  tx["xs"] = Xs;
-  tx["ys"] = Ys;
-  tx["rs"] = Rs;
-  JsonArray encArr = tx.createNestedArray("enc");
-  for (size_t i = 0; i < MOTOR_COUNT; i++) {
-    encArr.add(encSnap[i]);
-  }
-  JsonArray velArr = tx.createNestedArray("vel");
-  for (size_t i = 0; i < MOTOR_COUNT; i++) {
-    velArr.add(velFilt[i]);
-  }
-  serializeJson(tx, Serial);
-  Serial.println();
-}
-
-void stopAllMotors() {
-  for (size_t i = 0; i < MOTOR_COUNT; i++) {
-    motorCmd[i] = 0;
-    motors[i].pid.integral = 0;
-    motors[i].pid.prevErr  = 0;
-    driveMotor(MOTOR_PIN_L[i], MOTOR_PIN_R[i], 0);
-  }
-}
 
 /* ===========================================================
    SETUP
@@ -293,10 +202,12 @@ void stopAllMotors() {
 void setup() {
   Serial.begin(115200);
 
+  // PPM input
   pinMode(PPM_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(PPM_PIN), ppmISR, RISING);
 
-  for (size_t i = 0; i < MOTOR_COUNT; i++) {
+  // Encoder pins
+  for (int i = 0; i < MOTOR_COUNT; i++) {
     pinMode(ENC_A[i], INPUT_PULLUP);
     pinMode(ENC_B[i], INPUT_PULLUP);
     lastEnc[i] = 0;
@@ -308,9 +219,12 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_A[2]), enc3ISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_A[3]), enc4ISR, CHANGE);
 
-  for (size_t i = 0; i < MOTOR_COUNT; i++) {
+  // Motor PWM awal 0
+  for (int i = 0; i < MOTOR_COUNT; i++) {
     driveMotor(MOTOR_PIN_L[i], MOTOR_PIN_R[i], 0);
   }
+
+  Serial.println("Robot OMNI – FINAL PID + Auto-Trim READY");
 }
 
 /* ===========================================================
@@ -319,28 +233,22 @@ void setup() {
 void loop() {
   unsigned long nowMs = millis();
   float dt = (nowMs - lastLoopMs) / 1000.0f;
-  if (dt < 0.005f) {
-    handleSerialInput();
-    sendTelemetry(nowMs, 0.0f, true);
-    return;
-  }
+  if (dt < 0.005f) return;     // ~200 Hz
   lastLoopMs = nowMs;
 
-  handleSerialInput();
-
-  bool serialFresh = (nowMs - lastSerialCmdMs) <= SERIAL_CMD_TIMEOUT_MS;
-  float autoMag = max(max(fabs(autoX), fabs(autoY)), fabs(autoR));
-  bool autoCmdActive = serialFresh && (autoMag > AUTO_CMD_THRESHOLD);
-
+  /* ---------------------------------------------------
+     FAILSAFE PPM
+     --------------------------------------------------- */
   bool ppmOk = true;
   unsigned long nowUs = micros();
-  if (nowUs - lastPpmUpdate > 200000UL) {
+  if (nowUs - lastPpmUpdate > 200000UL) {   // > 200 ms tanpa PPM
     ppmOk = false;
   }
 
+  // Baca channel (PPM) – kalau invalid atau failsafe → netral
   int ch1 = ppmOk ? ppm[0] : 1500;
   int ch2 = ppmOk ? ppm[1] : 1500;
-  int ch3 = ppmOk ? ppm[2] : 1000;
+  int ch3 = ppmOk ? ppm[2] : 1000;  // gas = 0
   int ch4 = ppmOk ? ppm[3] : 1500;
 
   if (ch1 < 900 || ch1 > 2100) ch1 = 1500;
@@ -348,48 +256,62 @@ void loop() {
   if (ch3 < 900 || ch3 > 2100) ch3 = 1000;
   if (ch4 < 900 || ch4 > 2100) ch4 = 1500;
 
+  // Normalisasi joystick: -1 .. +1
   float Xr = (ch1 - 1500) / 500.0f;
   float Yr = (ch2 - 1500) / 500.0f;
   float Rr = (ch4 - 1500) / 500.0f;
   float gas = constrain((ch3 - 1000) / 1000.0f, 0.0f, 1.0f);
 
-  bool manualActive = (gas >= MANUAL_GAS_THRESHOLD) && ppmOk;
-  if (manualActive) {
-    autonomousMode = false;
-  } else if (autoCmdActive) {
-    autonomousMode = true;
-  } else if (!serialFresh) {
-    autonomousMode = false;
-  }
+  // Throttle kecil → matikan saja (supaya diam benar2 diam)
+  if (gas < 0.02f || !ppmOk) {
+    gas = 0.0f;
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+      motorCmd[i] = 0;
+      motors[i].pid.integral = 0;
+      motors[i].pid.prevErr  = 0;
+      driveMotor(MOTOR_PIN_L[i], MOTOR_PIN_R[i], 0);
+    }
 
-  if ((gas < 0.02f || !ppmOk) && !autonomousMode) {
-    stopAllMotors();
-    sendTelemetry(nowMs, gas, ppmOk);
+#if DEBUG_PRINT
+    debugCounter++;
+    if (debugCounter >= 50) {   // print lebih jarang saat idle
+      debugCounter = 0;
+      Serial.println("ENC: 0,0,0,0");
+    }
+#endif
+
     return;
   }
 
+  /* ---------------------------------------------------
+     APLIKASI TRIM INPUT
+     --------------------------------------------------- */
   float trimX = (Yr >= 0.0f) ? TRIM_X_FWD : TRIM_X_REV;
 
-  float manualX = expo(deadzone(Xr - trimX));
-  float manualY = expo(deadzone(Yr));
-  float manualR = expo(deadzone(Rr - TRIM_R));
+  float X = expo(deadzone(Xr - trimX));
+  float Y = expo(deadzone(Yr));
+  float R = expo(deadzone(Rr - TRIM_R));
 
-  if (autonomousMode) {
-    Xs = smooth(Xs, constrain(autoX, -1.0f, 1.0f), 0.10f);
-    Ys = smooth(Ys, constrain(autoY, -1.0f, 1.0f), 0.10f);
-    Rs = smooth(Rs, constrain(autoR, -1.0f, 1.0f), 0.10f);
-  } else {
-    Xs = smooth(Xs, manualX, 0.08f);
-    Ys = smooth(Ys, manualY, 0.08f);
-    Rs = smooth(Rs, manualR, 0.08f);
-  }
+  // Smooth sedikit
+  Xs = smooth(Xs, X, 0.08f);
+  Ys = smooth(Ys, Y, 0.08f);
+  Rs = smooth(Rs, R, 0.08f);
 
+  /* ---------------------------------------------------
+     KINEMATIKA OMNI 4 RODA
+     Index:
+       0 = M1 (kiri depan)
+       1 = M2 (kanan depan)
+       2 = M3 (kiri belakang)
+       3 = M4 (kanan belakang)
+     --------------------------------------------------- */
   float mix[4];
   mix[0] = Ys - Xs - Rs;  // M1
   mix[1] = Ys + Xs + Rs;  // M2
   mix[2] = Ys - Xs + Rs;  // M3
   mix[3] = Ys + Xs - Rs;  // M4
 
+  // Normalize kalau lebih dari 1
   float maxv = 0.0f;
   for (int i = 0; i < 4; i++) {
     if (fabs(mix[i]) > maxv) maxv = fabs(mix[i]);
@@ -398,24 +320,30 @@ void loop() {
     for (int i = 0; i < 4; i++) mix[i] /= maxv;
   }
 
-  float effectiveGas = autonomousMode ? 1.0f : gas;
-
+  // Target tick per period (loop) untuk tiap motor
   float tgt[4];
   for (int i = 0; i < 4; i++) {
-    tgt[i] = mix[i] * MAX_TICK * effectiveGas;
+    tgt[i] = mix[i] * MAX_TICK * gas;
   }
 
+  /* ---------------------------------------------------
+     ENCODER VELOCITY PER LOOP
+     --------------------------------------------------- */
   long snap[4];
   for (int i = 0; i < 4; i++) {
     snap[i] = encCount[i];
     float v = (float)(snap[i] - lastEnc[i]);
     lastEnc[i] = snap[i];
-    velFilt[i] = lowPass(velFilt[i], v, 0.40f);
+    velFilt[i] = lowPass(velFilt[i], v, 0.40f);  // 0.4 = lumayan responsif
   }
 
-  float pwmLimit = 255.0f * effectiveGas;
+  /* ---------------------------------------------------
+     PID + FEEDFORWARD + ACCEL LIMIT + KOMPENSASI
+     --------------------------------------------------- */
+  float pwmLimit = 255.0f * gas;
 
   for (int i = 0; i < 4; i++) {
+    // FEEDFORWARD (direct proportional ke target)
     const float FF_GAIN = 2.3f;
     float ff = tgt[i] * FF_GAIN;
 
@@ -423,22 +351,28 @@ void loop() {
 
     float desired = ff + corr;
 
+    // Acceleration limit
     float delta = desired - motorCmd[i];
     delta = constrain(delta, -ACCEL_STEP, ACCEL_STEP);
     motorCmd[i] += delta;
 
+    // Kompensasi berbeda maju/mundur
     float comp = (motorCmd[i] >= 0.0f) ? motors[i].compFwd : motors[i].compRev;
     float adj = motorCmd[i] * comp;
 
+    // Apply min PWM & clamp ke gas
     int pwm = applyMinPwm(adj, motors[i], tgt[i]);
     pwm = constrain(pwm, -(int)pwmLimit, (int)pwmLimit);
 
     driveMotor(MOTOR_PIN_L[i], MOTOR_PIN_R[i], pwm);
   }
 
+  /* ---------------------------------------------------
+     DEBUG PRINT (ENCODER)
+     --------------------------------------------------- */
 #if DEBUG_PRINT
   debugCounter++;
-  if (debugCounter >= 10) {
+  if (debugCounter >= 10) {   // setiap ~10 loop ≈ 20 Hz
     debugCounter = 0;
     Serial.print("ENC: ");
     for (int i = 0; i < 4; i++) {
@@ -448,6 +382,4 @@ void loop() {
     Serial.println();
   }
 #endif
-
-  sendTelemetry(nowMs, gas, ppmOk);
 }
